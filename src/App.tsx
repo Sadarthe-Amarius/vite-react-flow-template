@@ -3,19 +3,34 @@ import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 're
 import { ReactFlow, Background, Controls, Handle, Position } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 
-const KEY = 'branchlab-notion-v2';
-const START = [
-  { id: 'root', parent: null, side: 'bottom', text: 'Ma décision principale' },
-  { id: 'a', parent: 'root', side: 'left', text: 'Possibilité A' },
-  { id: 'b', parent: 'root', side: 'right', text: 'Possibilité B' },
+const OLD_KEY = 'branchlab-notion-v2'; // single-page storage of earlier versions (never touched, so it stays as a backup)
+const KEY = 'branchlab-pages-v1';
+const makeStart = () => [
+  { id: 'root', parent: null, side: 'bottom', text: 'My main decision' },
+  { id: 'a', parent: 'root', side: 'left', text: 'Possibility A' },
+  { id: 'b', parent: 'root', side: 'right', text: 'Possibility B' },
 ];
-// Mise en page pensée pour un panneau étroit : l'arbre descend et chaque niveau est décalé vers la droite
+// Layout made for a narrow panel: the tree goes down and every level is shifted a little to the right
 const INDENT = 34;
 const GAP = 24;
 const PAD = 14;
 const TYPES = { branch: Branch };
 
-// Une case et toutes ses descendantes
+const validItems = list => Array.isArray(list) && list.some(i => i && i.id === 'root');
+function load() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(KEY));
+    const pages = raw && Array.isArray(raw.pages) ? raw.pages.filter(p => p && p.id && validItems(p.items)) : [];
+    if (pages.length) return { pages, current: pages.some(p => p.id === raw.current) ? raw.current : pages[0].id };
+  } catch {}
+  try { // first launch of the multi-page version: the old single map becomes page 1
+    const old = JSON.parse(localStorage.getItem(OLD_KEY));
+    if (validItems(old)) return { pages: [{ id: 'p1', name: '1', items: old }], current: 'p1' };
+  } catch {}
+  return { pages: [{ id: 'p1', name: '1', items: makeStart() }], current: 'p1' };
+}
+
+// A box and all of its descendants
 function descendants(items, id) {
   const gone = new Set([id]);
   let changed = true;
@@ -30,8 +45,8 @@ function Branch({ id, data }) {
   const box = useRef(null);
   const area = useRef(null);
   const caret = useRef(null);
-  const lastChange = useRef(0);
-  // La case grandit pendant la frappe (jamais de défilement interne) et tout décalage ajouté par le navigateur est remis à zéro
+  const guard = useRef(0);
+  // The box grows while typing (no inner scrolling) and any shift added by the browser is reset
   const fit = () => {
     const a = area.current;
     if (!a) return;
@@ -40,7 +55,25 @@ function Branch({ id, data }) {
     for (let p = a; p; p = p.parentElement) { if (p.scrollTop) p.scrollTop = 0; if (p.scrollLeft) p.scrollLeft = 0; }
   };
   useLayoutEffect(() => { fit(); }, [data.text]);
-  // Mesure la hauteur réelle de la case pour que les cases ne se chevauchent jamais
+  // Focus guard: for a moment after each keystroke, if the text cursor disappears without the user clicking
+  // somewhere else, it is put back at the same place (frame by frame, so it also works if the box is briefly hidden)
+  const watch = () => {
+    const started = Date.now();
+    guard.current = started;
+    const tick = () => {
+      const a = area.current;
+      if (!a || guard.current !== started || Date.now() - started > 900 || data.lastIntent() >= started) return;
+      if (document.hasFocus() && document.activeElement !== a) {
+        a.focus({ preventScroll: true });
+        const c = caret.current;
+        if (c) { try { a.setSelectionRange(c[0], c[1]); } catch {} }
+        data.report('cursor restored ' + (Date.now() - started) + ' ms after a keystroke');
+      }
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  };
+  // Measures the real height of the box so boxes never overlap
   useEffect(() => {
     const el = box.current;
     if (!el) return;
@@ -50,13 +83,13 @@ function Branch({ id, data }) {
     ro.observe(el);
     return () => ro.disconnect();
   }, [id]);
-  // Une nouvelle branche prend le curseur tout de suite : il suffit de taper
+  // A new branch gets the cursor immediately: just type
   useEffect(() => {
     if (!data.focusMe) return;
     const t = setTimeout(() => { area.current?.focus({ preventScroll: true }); area.current?.select(); }, 90);
     return () => clearTimeout(t);
   }, [data.focusMe]);
-  // Pendant la saisie, la vue suit le texte pour ne jamais écrire hors de l'écran
+  // While typing, the view follows the text so you never write off screen
   useEffect(() => {
     if (document.activeElement !== area.current) return;
     const r = requestAnimationFrame(() => data.follow(id, true));
@@ -65,31 +98,18 @@ function Branch({ id, data }) {
   const cls = 'branch' + (data.top ? ' root' : '') + (data.selected ? ' selected' : '') + (data.dim ? ' dim' : '');
   return <div ref={box} className={cls} onClick={() => data.pick(id)}>
     <Handle type="target" position={Position.Left} style={{ opacity: 0, top: 24 }} />
-    <textarea ref={area} className="nodrag nopan" value={data.text} rows={1} spellCheck={false} aria-label="Texte de la branche"
-      onChange={e => { fit(); caret.current = [e.target.selectionStart, e.target.selectionEnd]; lastChange.current = Date.now(); data.rename(id, e.target.value); }}
+    <textarea ref={area} className="nodrag nopan" value={data.text} rows={1} spellCheck={false} aria-label="Branch text"
+      onChange={e => { fit(); caret.current = [e.target.selectionStart, e.target.selectionEnd]; watch(); data.rename(id, e.target.value); }}
       onSelect={e => { caret.current = [e.target.selectionStart, e.target.selectionEnd]; }}
       onFocus={() => data.select(id)}
-      onBlur={() => {
-        data.endEdit();
-        const a = area.current;
-        // Perte de curseur involontaire en pleine frappe (alors que la fenêtre garde le focus) : on le remet au même endroit
-        if (Date.now() - lastChange.current < 400 && Date.now() - data.lastIntent() > 500 && document.hasFocus()) {
-          requestAnimationFrame(() => {
-            if (a && document.activeElement !== a) {
-              a.focus({ preventScroll: true });
-              const c = caret.current;
-              if (c) a.setSelectionRange(c[0], c[1]);
-            }
-          });
-        }
-      }}
-      placeholder="Écris ton idée..." />
+      onBlur={() => data.endEdit()}
+      placeholder="Write your idea..." />
     {data.selected && !data.moving && <div className="tools nodrag nopan">
-      {id !== 'root' && <button title="Changer le parent de cette branche (M)" onClick={e => { e.stopPropagation(); data.startMove(id); }}>Déplacer</button>}
-      <button title="Ajouter une case au même niveau (S)" onClick={e => { e.stopPropagation(); data.addSibling(id); }}>+ Voisine</button>
-      {id !== 'root' && <button className="del" title="Supprimer la branche (Suppr)" onClick={e => { e.stopPropagation(); data.remove(id); }}>✕</button>}
+      {id !== 'root' && <button title="Change the parent of this branch (M)" onClick={e => { e.stopPropagation(); data.startMove(id); }}>Move</button>}
+      <button title="Add a box at the same level (S)" onClick={e => { e.stopPropagation(); data.addSibling(id); }}>+ Sibling</button>
+      {id !== 'root' && <button className="del" title="Delete branch (Del)" onClick={e => { e.stopPropagation(); data.remove(id); }}>✕</button>}
     </div>}
-    <button className="plus nodrag nopan" title="Ajouter une sous-branche (A)"
+    <button className="plus nodrag nopan" title="Add a sub-branch (A)"
       onClick={e => { e.stopPropagation(); data.add(id, 'bottom'); }}>+</button>
     <Handle type="source" position={Position.Bottom} style={{ opacity: 0, left: 22 }} />
   </div>;
@@ -98,7 +118,7 @@ function Branch({ id, data }) {
 function layout(items, heights) {
   const groups = new Map();
   for (const item of items) groups.set(item.parent, [...(groups.get(item.parent) || []), item]);
-  const rank = { left: 0, bottom: 1, right: 2 }; // anciennes cartes : l'ordre gauche/bas/droite est conservé
+  const rank = { left: 0, bottom: 1, right: 2 }; // older maps: the left/bottom/right order is kept
   for (const group of groups.values()) group.sort((a, b) => rank[a.side] - rank[b.side]);
   const positions = {};
   let y = PAD;
@@ -108,26 +128,29 @@ function layout(items, heights) {
     y += (heights[id] || 70) + GAP;
     for (const child of groups.get(id) || []) place(child.id, depth + 1);
   }
-  // Plusieurs cases de premier niveau sont possibles (parent = null)
+  // Several top-level boxes are possible (parent = null)
   for (const top of groups.get(null) || []) place(top.id, 0);
   return positions;
 }
 
 export default function App() {
-  const [items, setItems] = useState(() => { try {
-    const saved = JSON.parse(localStorage.getItem(KEY));
-    return Array.isArray(saved) && saved.some(i => i.id === 'root') ? saved : START;
-  } catch { return START; } });
+  const [store, setStore] = useState(load); // { pages: [{ id, name, items }], current }
+  const storeRef = useRef(store); storeRef.current = store;
+  const { pages, current } = store;
+  const page = pages.find(p => p.id === current) || pages[0];
+  const items = page.items;
   const [selected, setSelected] = useState('root');
   const [focusId, setFocusId] = useState(null);
   const [heights, setHeights] = useState({});
-  const [exportText, setExportText] = useState(null);
-  const [moving, setMoving] = useState(null); // case en cours de déplacement
+  const [moving, setMoving] = useState(null); // box being moved
   const [help, setHelp] = useState(false);
-  // La carte n'attrape la molette qu'après un clic dedans (sinon la page Notion défile normalement)
+  const [dbg, setDbg] = useState('none so far');
+  const [renaming, setRenaming] = useState(null);
+  const [draft, setDraft] = useState('');
+  // The map only catches the mouse wheel after a click on it (otherwise the Notion page scrolls normally)
   const [active, setActive] = useState(() => typeof document !== 'undefined' && document.hasFocus());
   const rf = useRef(null);
-  const intent = useRef(0); // dernier moment où la perte de focus était voulue (clic, Tab, Échap)
+  const intent = useRef(0); // last moment a loss of focus was wanted (click, Tab, Esc)
 
   useEffect(() => {
     const on = () => setActive(true);
@@ -145,9 +168,11 @@ export default function App() {
     };
   }, []);
 
+  const setItems = next => setStore(s => ({ ...s, pages: s.pages.map(p => p.id === s.current
+    ? { ...p, items: typeof next === 'function' ? next(p.items) : next } : p) }));
   const measure = (id, h) => setHeights(old => Math.abs((old[id] || 0) - h) < 1 ? old : { ...old, [id]: h });
 
-  // Fait glisser la vue juste ce qu'il faut pour que la case reste entièrement visible
+  // Scrolls the view just enough to keep a box fully visible
   const keepVisible = (id, typingMode) => {
     const inst = rf.current;
     if (!inst) return;
@@ -159,7 +184,7 @@ export default function App() {
     let dx = 0, dy = 0;
     if (a.bottom > b.bottom - m) dy = (b.bottom - m) - a.bottom;
     if (a.top + dy < b.top + m) dy = (b.top + m) - a.top;
-    if (!typingMode) { // pendant la frappe on ne suit que verticalement, jamais de glissement sur le côté
+    if (!typingMode) { // while typing the view only follows vertically, never sideways
       if (a.right > b.right - m) dx = (b.right - m) - a.right;
       if (a.left + dx < b.left + m) dx = (b.left + m) - a.left;
     }
@@ -168,41 +193,43 @@ export default function App() {
     inst.setViewport({ x: v.x + dx, y: v.y + dy, zoom: v.zoom }, typingMode ? undefined : { duration: 120 });
   };
 
-  // Historique : pas de confirmation, on peut revenir en arrière (Ctrl+Z) ou refaire (Ctrl+Y)
-  const itemsRef = useRef(items); itemsRef.current = items;
+  // History: no confirmations anywhere, Ctrl+Z brings anything back (it covers all pages)
   const past = useRef([]);
   const future = useRef([]);
-  const typing = useRef(null); // case en cours de saisie (une saisie = une seule étape d'historique)
+  const typing = useRef(null); // box being typed in (one typing session = one history step)
   const [, bump] = useState(0);
   const commit = () => {
-    past.current.push(itemsRef.current);
+    past.current.push(storeRef.current);
     if (past.current.length > 100) past.current.shift();
     future.current = [];
     bump(n => n + 1);
   };
-  const restore = next => {
-    itemsRef.current = next; setItems(next); typing.current = null; setFocusId(null); setMoving(null);
-    setSelected(s => next.some(i => i.id === s) ? s : 'root'); bump(n => n + 1);
+  const resetView = () => { setHeights({}); setSelected('root'); setFocusId(null); setMoving(null); typing.current = null; };
+  const restore = snap => {
+    if (snap.current !== storeRef.current.current) resetView();
+    storeRef.current = snap; setStore(snap); typing.current = null; setFocusId(null); setMoving(null);
+    const snapItems = (snap.pages.find(p => p.id === snap.current) || { items: [] }).items;
+    setSelected(s => snapItems.some(i => i.id === s) ? s : 'root'); bump(n => n + 1);
   };
   const undo = () => {
     if (!past.current.length) return;
-    future.current.push(itemsRef.current); restore(past.current.pop());
+    future.current.push(storeRef.current); restore(past.current.pop());
   };
   const redo = () => {
     if (!future.current.length) return;
-    past.current.push(itemsRef.current); restore(future.current.pop());
+    past.current.push(storeRef.current); restore(future.current.pop());
   };
 
-  useEffect(() => { try { localStorage.setItem(KEY, JSON.stringify(items)); } catch {} }, [items]);
+  useEffect(() => { try { localStorage.setItem(KEY, JSON.stringify(store)); } catch {} }, [store]);
 
-  // Après un ajout, la vue suit la nouvelle case si elle n'est pas déjà visible
+  // After adding a box, the view follows it if it is not already visible
   useEffect(() => {
     if (!focusId) return;
     const t = setTimeout(() => keepVisible(focusId), 140);
     return () => clearTimeout(t);
   }, [focusId]);
 
-  // Empêche le navigateur de décaler le contenu quand le curseur d'écriture approche du bord
+  // Stops the browser from shifting the content when the text cursor gets close to an edge
   const stopScroll = e => {
     const t = e.target;
     if (t && (t.scrollTop || t.scrollLeft)) { t.scrollTop = 0; t.scrollLeft = 0; }
@@ -215,9 +242,9 @@ export default function App() {
   const endEdit = () => { typing.current = null; };
   const add = (parent, side) => { const id = crypto.randomUUID();
     commit(); typing.current = null;
-    setItems(old => [...old, { id, parent, side, text: 'Nouvelle possibilité' }]);
+    setItems(old => [...old, { id, parent, side, text: 'New possibility' }]);
     setSelected(id); setFocusId(id); };
-  // Même niveau que la case choisie, placée juste après elle (y compris pour la case initiale)
+  // Same level as the chosen box, placed right after it (also works for the initial box)
   const addSibling = id => {
     const cur = items.find(i => i.id === id);
     if (!cur) return;
@@ -226,7 +253,7 @@ export default function App() {
     setItems(old => {
       const idx = old.findIndex(i => i.id === id);
       const copy = old.slice();
-      copy.splice(idx + 1, 0, { id: nid, parent: cur.parent, side: cur.side, text: cur.parent === null ? 'Nouvelle décision' : 'Nouvelle possibilité' });
+      copy.splice(idx + 1, 0, { id: nid, parent: cur.parent, side: cur.side, text: cur.parent === null ? 'New decision' : 'New possibility' });
       return copy;
     });
     setSelected(nid); setFocusId(nid);
@@ -240,8 +267,9 @@ export default function App() {
     setItems(old => old.filter(i => !gone.has(i.id)));
     setSelected(cur.parent || 'root'); setFocusId(null);
   };
-  const reset = () => { commit(); typing.current = null; setItems(START); setSelected('root'); setFocusId(null); setMoving(null); };
-  // Change le parent d'une branche (avec tous ses descendants) sans rien supprimer
+  // Clears the current page only (other pages are untouched)
+  const reset = () => { commit(); resetView(); setItems(makeStart()); };
+  // Changes the parent of a branch (with all its descendants) without deleting anything
   const reparent = (id, newParent) => {
     commit(); typing.current = null;
     setItems(old => {
@@ -259,14 +287,35 @@ export default function App() {
     if (moving) { if (!descendants(items, moving).has(id)) reparent(moving, id); return; }
     setSelected(id);
   };
-  const exportJSON = () => {
-    const json = JSON.stringify(items, null, 2);
-    // Si le téléchargement est bloqué par Notion, le texte reste copiable dans la zone affichée
-    setExportText(json);
-    try { const url = URL.createObjectURL(new Blob([json], { type: 'application/json' }));
-      const a = document.createElement('a'); a.href = url; a.download = 'branchlab.json'; a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000); } catch {}
+
+  // Pages
+  const switchPage = id => {
+    if (id === current || !pages.some(p => p.id === id)) return;
+    resetView();
+    setStore(s => ({ ...s, current: id }));
   };
-  const copyExport = () => { try { navigator.clipboard.writeText(exportText); } catch {} };
+  const newPage = () => {
+    commit(); resetView();
+    const id = crypto.randomUUID();
+    setStore(s => {
+      const n = String(Math.max(0, ...s.pages.map(p => parseInt(p.name, 10) || 0)) + 1);
+      return { pages: [...s.pages, { id, name: n, items: makeStart() }], current: id };
+    });
+  };
+  const deletePage = id => {
+    if (pages.length <= 1) return;
+    commit();
+    const idx = pages.findIndex(p => p.id === id);
+    const rest = pages.filter(p => p.id !== id);
+    const nextCurrent = id === current ? rest[Math.max(0, idx - 1)].id : current;
+    if (nextCurrent !== current) resetView();
+    setStore({ pages: rest, current: nextCurrent });
+  };
+  const finishRename = id => {
+    const name = draft.trim();
+    if (name) setStore(s => ({ ...s, pages: s.pages.map(p => p.id === id ? { ...p, name } : p) }));
+    setRenaming(null);
+  };
 
   const positions = useMemo(() => layout(items, heights), [items, heights]);
   const order = useMemo(() => items.filter(i => positions[i.id]).sort((a, b) => positions[a.id].y - positions[b.id].y).map(i => i.id), [items, positions]);
@@ -286,7 +335,7 @@ export default function App() {
     if (ta) { ta.focus({ preventScroll: true }); const n = ta.value.length; ta.setSelectionRange(n, n); }
   };
 
-  // Raccourcis clavier (le gestionnaire est remplacé à chaque rendu pour voir l'état à jour)
+  // Keyboard shortcuts (the handler is replaced on every render so it always sees the latest state)
   const keyRef = useRef(null);
   keyRef.current = e => {
     const t = e.target;
@@ -318,6 +367,11 @@ export default function App() {
     else if (k === 's' || k === 'S') { e.preventDefault(); addSibling(selected); }
     else if (k === 'Delete' || k === 'Backspace') { e.preventDefault(); remove(selected); }
     else if (k === 'm' || k === 'M') { e.preventDefault(); startMove(selected); }
+    else if (k === '[' || k === ']') {
+      e.preventDefault();
+      const i = pages.findIndex(p => p.id === current);
+      switchPage(pages[(i + (k === ']' ? 1 : -1) + pages.length) % pages.length].id);
+    }
     else if (k === '?') { e.preventDefault(); setHelp(h => !h); }
   };
   useEffect(() => {
@@ -326,13 +380,31 @@ export default function App() {
     return () => window.removeEventListener('keydown', h);
   }, []);
 
-  const nodes = items.filter(i => positions[i.id]).map(i => ({ id: i.id, type: 'branch', position: positions[i.id], draggable: false,
-    data: { text: i.text, top: i.parent === null, selected: selected === i.id, focusMe: focusId === i.id,
-      dim: !!(invalid && invalid.has(i.id)), moving: !!moving,
-      rename, endEdit, add, addSibling, remove, startMove, pick, measure, follow: keepVisible, select: setSelected,
-      lastIntent: () => intent.current } }));
-  const edges = items.filter(i => i.parent && positions[i.id] && positions[i.parent]).map(i => ({
-    id: 'e-' + i.id, source: i.parent, target: i.id, type: 'smoothstep', style: { stroke: '#8ba5d2', strokeWidth: 2 } }));
+  // Callbacks given to the boxes keep the same identity forever, and a box object is only rebuilt when
+  // something about it really changed: this keeps React Flow from re-reading every box on every keystroke
+  const api = useRef({});
+  api.current = { rename, endEdit, add, addSibling, remove, startMove, pick, measure, follow: keepVisible,
+    lastIntent: () => intent.current, report: setDbg };
+  const stable = useMemo(() => {
+    const w = name => (...args) => api.current[name](...args);
+    return { rename: w('rename'), endEdit: w('endEdit'), add: w('add'), addSibling: w('addSibling'), remove: w('remove'),
+      startMove: w('startMove'), pick: w('pick'), measure: w('measure'), follow: w('follow'), lastIntent: w('lastIntent'),
+      report: w('report'), select: setSelected };
+  }, []);
+  const nodeCache = useRef(new Map());
+  const nodes = items.filter(i => positions[i.id]).map(i => {
+    const pos = positions[i.id];
+    const flags = { top: i.parent === null, selected: selected === i.id, focusMe: focusId === i.id,
+      dim: !!(invalid && invalid.has(i.id)), moving: !!moving };
+    const sig = JSON.stringify([i.text, flags, pos.x, pos.y]);
+    const hit = nodeCache.current.get(i.id);
+    if (hit && hit.sig === sig) return hit.node;
+    const node = { id: i.id, type: 'branch', position: { x: pos.x, y: pos.y }, draggable: false, data: { text: i.text, ...flags, ...stable } };
+    nodeCache.current.set(i.id, { sig, node });
+    return node;
+  });
+  const edges = useMemo(() => items.filter(i => i.parent && positions[i.id] && positions[i.parent]).map(i => ({
+    id: 'e-' + i.id, source: i.parent, target: i.id, type: 'smoothstep', style: { stroke: '#8ba5d2', strokeWidth: 2 } })), [items, positions]);
 
   return <div className={'app' + (active ? ' active' : '') + (moving ? ' moving' : '')}>
     <style>{`
@@ -344,13 +416,18 @@ export default function App() {
       .app.active .bar{border-top-color:#5683eb}
       .bar button{border:1px solid #d1daea;border-radius:8px;padding:5px 9px;background:#fff;cursor:pointer;font-size:12px;color:#223456;white-space:nowrap;flex:none}
       .bar button:disabled{opacity:.4;cursor:default}
-      .bar .spacer{flex:1;min-width:0}
       .bar .hint{font-size:12px;color:#8a5a12;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;flex:1}
-      .export{padding:8px;background:#fff;border-top:1px solid #dae1f0;display:flex;gap:6px;align-items:flex-start}
-      .export textarea{flex:1;height:64px;min-width:0;font:11px/1.3 monospace;border:1px solid #d1daea;border-radius:8px;padding:6px}
-      .export button{border:1px solid #d1daea;border-radius:8px;padding:5px 9px;background:#fff;cursor:pointer;font-size:12px}
+      .tabs{display:flex;gap:4px;flex:1;min-width:0;overflow-x:auto;scrollbar-width:none;padding:1px}
+      .tabs::-webkit-scrollbar{display:none}
+      .bar .tab{padding:5px 10px;border-radius:14px;border-color:#d1daea;background:#f4f7fd}
+      .bar .tab.on{background:#223456;border-color:#223456;color:#fff}
+      .tab .tx{margin-left:6px;opacity:.7;font-size:13px}
+      .tab .tx:hover{opacity:1}
+      .bar .tabadd{padding:5px 9px;border-radius:14px;font-size:14px;line-height:1}
+      .tabinput{width:70px;flex:none;border:1px solid #5683eb;border-radius:14px;padding:4px 9px;font-size:12px;outline:none;color:#223456}
       .help{position:absolute;left:8px;right:8px;top:8px;z-index:20;background:#fff;border:1px solid #cfd8ec;border-radius:12px;padding:10px 12px;font-size:12.5px;line-height:1.7;color:#223456;box-shadow:0 8px 24px #20345a26}
       .help b{display:inline-block;min-width:92px;color:#2860d4}
+      .help .dbg{margin-top:6px;padding-top:6px;border-top:1px solid #e3e9f6;font-size:11px;color:#6d7b97;line-height:1.4}
       .branch{width:240px;min-height:44px;background:#fff;border:2px solid #d3dded;border-radius:12px;padding:9px 12px 10px;position:relative;box-shadow:0 3px 12px #20345a12}
       .branch.root{background:#edf3ff}.branch.selected{border-color:#5683eb}
       .branch.dim{opacity:.35}
@@ -366,7 +443,7 @@ export default function App() {
       .tools .del:hover{background:#d64545;color:#fff;border-color:#d64545}
     `}</style>
     <div className="canvas" onScrollCapture={stopScroll}>
-      <ReactFlow nodes={nodes} edges={edges} nodeTypes={TYPES}
+      <ReactFlow key={current} nodes={nodes} edges={edges} nodeTypes={TYPES}
         defaultViewport={{ x: 6, y: 6, zoom: 1 }} minZoom={0.3} maxZoom={1.6}
         onInit={inst => { rf.current = inst; }}
         nodesDraggable={false} nodesConnectable={false} disableKeyboardA11y deleteKeyCode={null}
@@ -375,34 +452,43 @@ export default function App() {
         <Background gap={22} size={1} color="#d3deee" /><Controls showInteractive={false} />
       </ReactFlow>
       {help && <div className="help" onClick={() => setHelp(false)}>
-        <div><b>Tab / Maj+Tab</b>case suivante / précédente</div>
-        <div><b>↑ ↓ ← →</b>naviguer (← parent, → premier enfant)</div>
-        <div><b>A ou +</b>ajouter une sous-branche</div>
-        <div><b>S</b>ajouter une case au même niveau</div>
-        <div><b>Entrée ou E</b>écrire dans la case</div>
-        <div><b>Échap</b>arrêter d'écrire</div>
-        <div><b>M</b>changer le parent (Entrée sur la nouvelle)</div>
-        <div><b>Suppr</b>supprimer la branche</div>
-        <div><b>Ctrl+Z / Ctrl+Y</b>annuler / rétablir</div>
-        <div><b>?</b>afficher ou cacher cette aide</div>
+        <div><b>Tab / Shift+Tab</b>next / previous box</div>
+        <div><b>Arrow keys</b>navigate (left = parent, right = first child)</div>
+        <div><b>A or +</b>add a sub-branch</div>
+        <div><b>S</b>add a box at the same level</div>
+        <div><b>Enter or E</b>write in the box</div>
+        <div><b>Esc</b>stop writing</div>
+        <div><b>M</b>change the parent (then Enter on the new one)</div>
+        <div><b>Del</b>delete the branch</div>
+        <div><b>[ and ]</b>previous / next page</div>
+        <div><b>Ctrl+Z / Ctrl+Y</b>undo / redo</div>
+        <div><b>?</b>show or hide this help</div>
+        <div className="dbg">Last typing recovery: {dbg}</div>
       </div>}
     </div>
-    {exportText !== null && <div className="export">
-      <textarea readOnly value={exportText} onFocus={e => e.target.select()} />
-      <button onClick={copyExport}>Copier</button><button onClick={() => setExportText(null)}>Fermer</button>
-    </div>}
     <div className="bar">
       {moving ? <>
-        <span className="hint">Clique la nouvelle case parente</span>
-        <button onClick={() => reparent(moving, null)}>Niveau principal</button>
-        <button onClick={() => setMoving(null)}>Annuler</button>
+        <span className="hint">Click the new parent box</span>
+        <button onClick={() => reparent(moving, null)}>Main level</button>
+        <button onClick={() => setMoving(null)}>Cancel</button>
       </> : <>
-        <button title="Annuler (Ctrl+Z)" disabled={!past.current.length} onClick={undo}>↶</button>
-        <button title="Rétablir (Ctrl+Y)" disabled={!future.current.length} onClick={redo}>↷</button>
-        <span className="spacer" />
-        <button onClick={exportJSON}>Exporter</button>
-        <button onClick={reset}>Réinitialiser</button>
-        <button title="Raccourcis clavier (?)" onClick={() => setHelp(h => !h)}>?</button>
+        <button title="Undo (Ctrl+Z)" disabled={!past.current.length} onClick={undo}>↶</button>
+        <button title="Redo (Ctrl+Y)" disabled={!future.current.length} onClick={redo}>↷</button>
+        <div className="tabs">
+          {pages.map(p => renaming === p.id
+            ? <input key={p.id} className="tabinput" autoFocus maxLength={14} value={draft}
+                onChange={e => setDraft(e.target.value)} onBlur={() => finishRename(p.id)}
+                onKeyDown={e => { if (e.key === 'Enter') e.currentTarget.blur(); }} />
+            : <button key={p.id} className={'tab' + (p.id === current ? ' on' : '')} title="Open page (double-click to rename)"
+                onClick={() => switchPage(p.id)} onDoubleClick={() => { setRenaming(p.id); setDraft(p.name); }}>
+                {p.name}
+                {p.id === current && pages.length > 1 && <span className="tx" title="Delete this page"
+                  onClick={e => { e.stopPropagation(); deletePage(p.id); }}>×</span>}
+              </button>)}
+        </div>
+        <button className="tabadd" title="New page" onClick={newPage}>+</button>
+        <button title="Clear the current page" onClick={reset}>Reset</button>
+        <button title="Keyboard shortcuts (?)" onClick={() => setHelp(h => !h)}>?</button>
       </>}
     </div>
   </div>;
