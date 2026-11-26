@@ -17,17 +17,20 @@ const PAD = 14;
 const TYPES = { branch: Branch };
 
 const validItems = list => Array.isArray(list) && list.some(i => i && i.id === 'root');
+// A page only keeps a name when you renamed it; otherwise its label is its position (1, 2, 3...), so numbering is always continuous
+const normPages = list => list.map(p => ({ ...p, name: /^\d+$/.test(String(p.name || '').trim()) ? '' : String(p.name || '') }));
+const labelOf = (p, i) => p.name || String(i + 1);
 function load() {
   try {
     const raw = JSON.parse(localStorage.getItem(KEY));
-    const pages = raw && Array.isArray(raw.pages) ? raw.pages.filter(p => p && p.id && validItems(p.items)) : [];
+    const pages = raw && Array.isArray(raw.pages) ? normPages(raw.pages.filter(p => p && p.id && validItems(p.items))) : [];
     if (pages.length) return { pages, current: pages.some(p => p.id === raw.current) ? raw.current : pages[0].id };
   } catch {}
   try { // first launch of the multi-page version: the old single map becomes page 1
     const old = JSON.parse(localStorage.getItem(OLD_KEY));
-    if (validItems(old)) return { pages: [{ id: 'p1', name: '1', items: old }], current: 'p1' };
+    if (validItems(old)) return { pages: [{ id: 'p1', name: '', items: old }], current: 'p1' };
   } catch {}
-  return { pages: [{ id: 'p1', name: '1', items: makeStart() }], current: 'p1' };
+  return { pages: [{ id: 'p1', name: '', items: makeStart() }], current: 'p1' };
 }
 
 // A box and all of its descendants
@@ -115,11 +118,46 @@ function Branch({ id, data }) {
   </div>;
 }
 
-function layout(items, heights) {
+// Children of every box in display order (older maps: the left/bottom/right order is kept)
+function groupItems(items) {
   const groups = new Map();
   for (const item of items) groups.set(item.parent, [...(groups.get(item.parent) || []), item]);
-  const rank = { left: 0, bottom: 1, right: 2 }; // older maps: the left/bottom/right order is kept
+  const rank = { left: 0, bottom: 1, right: 2 };
   for (const group of groups.values()) group.sort((a, b) => rank[a.side] - rank[b.side]);
+  return groups;
+}
+
+// The whole page as plain indented text, ready to paste into an AI chat
+function toOutline(items, pageLabel) {
+  const groups = groupItems(items);
+  const lines = [];
+  const seen = new Set();
+  const walk = (item, depth) => {
+    if (seen.has(item.id)) return;
+    seen.add(item.id);
+    const text = (item.text || '').trim().replace(/\s*\n\s*/g, ' ') || '(empty)';
+    lines.push('  '.repeat(depth) + '- ' + text);
+    for (const child of groups.get(item.id) || []) walk(child, depth + 1);
+  };
+  for (const top of groups.get(null) || []) walk(top, 0);
+  return 'This is my decision map (page ' + pageLabel + '). Each indented line is a possibility or consequence that follows from the line above it. ' +
+    'Read it as a whole, point out gaps, risks or contradictions, and help me think through what to do next.\n\n' + lines.join('\n');
+}
+
+const copyText = async text => {
+  try { await navigator.clipboard.writeText(text); return true; } catch {}
+  try { // fallback for frames where the clipboard API is blocked
+    const ta = document.createElement('textarea');
+    ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.focus(); ta.select();
+    const ok = document.execCommand('copy');
+    document.body.removeChild(ta);
+    return ok;
+  } catch { return false; }
+};
+
+function layout(items, heights) {
+  const groups = groupItems(items);
   const positions = {};
   let y = PAD;
   function place(id, depth) {
@@ -145,6 +183,8 @@ export default function App() {
   const [moving, setMoving] = useState(null); // box being moved
   const [help, setHelp] = useState(false);
   const [dbg, setDbg] = useState('none so far');
+  const [shareText, setShareText] = useState(null); // shown only if the clipboard is blocked
+  const [copied, setCopied] = useState(false);
   const [renaming, setRenaming] = useState(null);
   const [draft, setDraft] = useState('');
   // The map only catches the mouse wheel after a click on it (otherwise the Notion page scrolls normally)
@@ -297,10 +337,7 @@ export default function App() {
   const newPage = () => {
     commit(); resetView();
     const id = crypto.randomUUID();
-    setStore(s => {
-      const n = String(Math.max(0, ...s.pages.map(p => parseInt(p.name, 10) || 0)) + 1);
-      return { pages: [...s.pages, { id, name: n, items: makeStart() }], current: id };
-    });
+    setStore(s => ({ pages: [...s.pages, { id, name: '', items: makeStart() }], current: id }));
   };
   const deletePage = id => {
     if (pages.length <= 1) return;
@@ -312,9 +349,17 @@ export default function App() {
     setStore({ pages: rest, current: nextCurrent });
   };
   const finishRename = id => {
-    const name = draft.trim();
-    if (name) setStore(s => ({ ...s, pages: s.pages.map(p => p.id === id ? { ...p, name } : p) }));
+    // an empty or purely numeric name goes back to the automatic number
+    const typed = draft.trim();
+    const name = typed && !/^\d+$/.test(typed) ? typed : '';
+    setStore(s => ({ ...s, pages: s.pages.map(p => p.id === id ? { ...p, name } : p) }));
     setRenaming(null);
+  };
+  const share = async () => {
+    const idx = pages.findIndex(p => p.id === current);
+    const text = toOutline(items, labelOf(page, idx));
+    if (await copyText(text)) { setShareText(null); setCopied(true); setTimeout(() => setCopied(false), 1600); }
+    else setShareText(text);
   };
 
   const positions = useMemo(() => layout(items, heights), [items, heights]);
@@ -343,6 +388,13 @@ export default function App() {
     const k = e.key;
     if (e.ctrlKey || e.metaKey) {
       const kk = k.toLowerCase();
+      if (kk === 'a') { // select all: only the text of the box, never the interface around it
+        if (t && t.tagName === 'INPUT') return;
+        e.preventDefault();
+        const ta = typingNow ? t : document.querySelector('.react-flow__node[data-id="' + selected + '"] textarea');
+        if (ta) { ta.focus({ preventScroll: true }); ta.select(); }
+        return;
+      }
       if (kk === 'z' && !e.shiftKey) { e.preventDefault(); undo(); }
       else if (kk === 'y' || (kk === 'z' && e.shiftKey)) { e.preventDefault(); redo(); }
       return;
@@ -365,6 +417,7 @@ export default function App() {
     else if (k === 'Enter' || k === 'F2' || k === 'e' || k === 'E') { e.preventDefault(); edit(selected); }
     else if (k === 'a' || k === 'A' || k === '+' || k === '=') { e.preventDefault(); add(selected, 'bottom'); }
     else if (k === 's' || k === 'S') { e.preventDefault(); addSibling(selected); }
+    else if (k === 'c' || k === 'C') { e.preventDefault(); share(); }
     else if (k === 'Delete' || k === 'Backspace') { e.preventDefault(); remove(selected); }
     else if (k === 'm' || k === 'M') { e.preventDefault(); startMove(selected); }
     else if (k === '[' || k === ']') {
@@ -409,7 +462,11 @@ export default function App() {
   return <div className={'app' + (active ? ' active' : '') + (moving ? ' moving' : '')}>
     <style>{`
       *{box-sizing:border-box} html,body,#root{width:100%;height:100%;margin:0} body{font-family:system-ui,sans-serif}
-      .app{height:100vh;height:100dvh;display:flex;flex-direction:column;background:#f4f7fd}
+      .app{height:100vh;height:100dvh;display:flex;flex-direction:column;background:#f4f7fd;user-select:none;-webkit-user-select:none}
+      .share{padding:8px;background:#fff;border-top:1px solid #dae1f0;display:flex;gap:6px;flex-wrap:wrap;align-items:flex-start}
+      .share .sharehint{width:100%;font-size:11.5px;color:#6d7b97}
+      .share textarea{flex:1;min-width:0;height:80px;font:11px/1.3 monospace;border:1px solid #d1daea;border-radius:8px;padding:6px;user-select:text;-webkit-user-select:text}
+      .share button{border:1px solid #d1daea;border-radius:8px;padding:5px 9px;background:#fff;cursor:pointer;font-size:12px;color:#223456}
       .canvas{flex:1;min-height:0;position:relative}
       .react-flow__node{outline:none!important}
       .bar{padding:5px 7px;background:#fff;border-top:2px solid #dae1f0;display:flex;flex-wrap:nowrap;gap:5px;align-items:center;overflow:hidden}
@@ -458,6 +515,8 @@ export default function App() {
         <div><b>S</b>add a box at the same level</div>
         <div><b>Enter or E</b>write in the box</div>
         <div><b>Esc</b>stop writing</div>
+        <div><b>Ctrl+A</b>select all the text of the box</div>
+        <div><b>C</b>copy this page as text for an AI chat</div>
         <div><b>M</b>change the parent (then Enter on the new one)</div>
         <div><b>Del</b>delete the branch</div>
         <div><b>[ and ]</b>previous / next page</div>
@@ -466,6 +525,11 @@ export default function App() {
         <div className="dbg">Last typing recovery: {dbg}</div>
       </div>}
     </div>
+    {shareText !== null && <div className="share">
+      <div className="sharehint">Copying is blocked here. Click the text, press Ctrl+A then Ctrl+C, and paste it into your AI chat.</div>
+      <textarea readOnly value={shareText} onFocus={e => e.target.select()} />
+      <button onClick={() => setShareText(null)}>Close</button>
+    </div>}
     <div className="bar">
       {moving ? <>
         <span className="hint">Click the new parent box</span>
@@ -475,18 +539,19 @@ export default function App() {
         <button title="Undo (Ctrl+Z)" disabled={!past.current.length} onClick={undo}>↶</button>
         <button title="Redo (Ctrl+Y)" disabled={!future.current.length} onClick={redo}>↷</button>
         <div className="tabs">
-          {pages.map(p => renaming === p.id
+          {pages.map((p, idx) => renaming === p.id
             ? <input key={p.id} className="tabinput" autoFocus maxLength={14} value={draft}
                 onChange={e => setDraft(e.target.value)} onBlur={() => finishRename(p.id)}
                 onKeyDown={e => { if (e.key === 'Enter') e.currentTarget.blur(); }} />
             : <button key={p.id} className={'tab' + (p.id === current ? ' on' : '')} title="Open page (double-click to rename)"
-                onClick={() => switchPage(p.id)} onDoubleClick={() => { setRenaming(p.id); setDraft(p.name); }}>
-                {p.name}
+                onClick={() => switchPage(p.id)} onDoubleClick={() => { setRenaming(p.id); setDraft(labelOf(p, idx)); }}>
+                {labelOf(p, idx)}
                 {p.id === current && pages.length > 1 && <span className="tx" title="Delete this page"
                   onClick={e => { e.stopPropagation(); deletePage(p.id); }}>×</span>}
               </button>)}
         </div>
         <button className="tabadd" title="New page" onClick={newPage}>+</button>
+        <button title="Copy this page as text to paste into an AI chat (C)" onClick={share}>{copied ? 'Copied ✓' : 'AI'}</button>
         <button title="Clear the current page" onClick={reset}>Reset</button>
         <button title="Keyboard shortcuts (?)" onClick={() => setHelp(h => !h)}>?</button>
       </>}
