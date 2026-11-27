@@ -4,7 +4,10 @@ import { ReactFlow, Background, Controls, Handle, Position } from '@xyflow/react
 import '@xyflow/react/dist/style.css';
 
 const OLD_KEY = 'branchlab-notion-v2'; // single-page storage of earlier versions (never touched, so it stays as a backup)
-const KEY = 'branchlab-pages-v1';
+// Every Notion page can have its own map: the link ends with ?m=<anything unique> (for example the Notion page id).
+// Without ?m the default map is used, exactly as before, so nothing already saved is touched.
+const MAP = (() => { try { return (new URLSearchParams(window.location.search).get('m') || '').replace(/[^\w-]/g, '').slice(0, 64); } catch { return ''; } })();
+const KEY = MAP ? 'branchlab-pages-v1:' + MAP : 'branchlab-pages-v1';
 const makeStart = () => [
   { id: 'root', parent: null, side: 'bottom', text: 'My main decision' },
   { id: 'a', parent: 'root', side: 'left', text: 'Possibility A' },
@@ -26,7 +29,8 @@ function load() {
     const pages = raw && Array.isArray(raw.pages) ? normPages(raw.pages.filter(p => p && p.id && validItems(p.items))) : [];
     if (pages.length) return { pages, current: pages.some(p => p.id === raw.current) ? raw.current : pages[0].id };
   } catch {}
-  try { // first launch of the multi-page version: the old single map becomes page 1
+  try { // first launch of the multi-page version: the old single map becomes page 1 (default map only)
+    if (MAP) throw 0;
     const old = JSON.parse(localStorage.getItem(OLD_KEY));
     if (validItems(old)) return { pages: [{ id: 'p1', name: '', items: old }], current: 'p1' };
   } catch {}
@@ -127,21 +131,22 @@ function groupItems(items) {
   return groups;
 }
 
-// The whole page as plain indented text, ready to paste into an AI chat
-function toOutline(items, pageLabel) {
+// The whole page as a plain text tree (no instructions: the structure alone tells the story)
+function toOutline(items) {
   const groups = groupItems(items);
   const lines = [];
   const seen = new Set();
-  const walk = (item, depth) => {
+  const clean = item => (item.text || '').trim().replace(/\s*\n\s*/g, ' ') || '(empty)';
+  const walk = (item, prefix, last, top) => {
     if (seen.has(item.id)) return;
     seen.add(item.id);
-    const text = (item.text || '').trim().replace(/\s*\n\s*/g, ' ') || '(empty)';
-    lines.push('  '.repeat(depth) + '- ' + text);
-    for (const child of groups.get(item.id) || []) walk(child, depth + 1);
+    lines.push(top ? clean(item) : prefix + (last ? '└─ ' : '├─ ') + clean(item));
+    const kids = groups.get(item.id) || [];
+    const next = top ? '' : prefix + (last ? '   ' : '│  ');
+    kids.forEach((child, i) => walk(child, next, i === kids.length - 1, false));
   };
-  for (const top of groups.get(null) || []) walk(top, 0);
-  return 'This is my decision map (page ' + pageLabel + '). Each indented line is a possibility or consequence that follows from the line above it. ' +
-    'Read it as a whole, point out gaps, risks or contradictions, and help me think through what to do next.\n\n' + lines.join('\n');
+  (groups.get(null) || []).forEach((top, i) => { if (i) lines.push(''); walk(top, '', true, true); });
+  return lines.join('\n');
 }
 
 const copyText = async text => {
@@ -356,8 +361,7 @@ export default function App() {
     setRenaming(null);
   };
   const share = async () => {
-    const idx = pages.findIndex(p => p.id === current);
-    const text = toOutline(items, labelOf(page, idx));
+    const text = toOutline(items);
     if (await copyText(text)) { setShareText(null); setCopied(true); setTimeout(() => setCopied(false), 1600); }
     else setShareText(text);
   };
@@ -516,17 +520,17 @@ export default function App() {
         <div><b>Enter or E</b>write in the box</div>
         <div><b>Esc</b>stop writing</div>
         <div><b>Ctrl+A</b>select all the text of the box</div>
-        <div><b>C</b>copy this page as text for an AI chat</div>
+        <div><b>C</b>copy this page as a text tree</div>
         <div><b>M</b>change the parent (then Enter on the new one)</div>
         <div><b>Del</b>delete the branch</div>
         <div><b>[ and ]</b>previous / next page</div>
         <div><b>Ctrl+Z / Ctrl+Y</b>undo / redo</div>
         <div><b>?</b>show or hide this help</div>
-        <div className="dbg">Last typing recovery: {dbg}</div>
+        <div className="dbg">Map: {MAP || 'default'}<br />Last typing recovery: {dbg}</div>
       </div>}
     </div>
     {shareText !== null && <div className="share">
-      <div className="sharehint">Copying is blocked here. Click the text, press Ctrl+A then Ctrl+C, and paste it into your AI chat.</div>
+      <div className="sharehint">Copying is blocked here. Click the text, press Ctrl+A then Ctrl+C, and paste it where you need it.</div>
       <textarea readOnly value={shareText} onFocus={e => e.target.select()} />
       <button onClick={() => setShareText(null)}>Close</button>
     </div>}
@@ -551,7 +555,7 @@ export default function App() {
               </button>)}
         </div>
         <button className="tabadd" title="New page" onClick={newPage}>+</button>
-        <button title="Copy this page as text to paste into an AI chat (C)" onClick={share}>{copied ? 'Copied ✓' : 'AI'}</button>
+        <button title="Copy this page as a text tree (C)" onClick={share}>{copied ? 'Copied ✓' : 'Copy'}</button>
         <button title="Clear the current page" onClick={reset}>Reset</button>
         <button title="Keyboard shortcuts (?)" onClick={() => setHelp(h => !h)}>?</button>
       </>}
